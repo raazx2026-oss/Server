@@ -1,29 +1,31 @@
 import os
-import json
-import subprocess
 from datetime import datetime, timedelta
 from typing import List
 
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
 from supabase import create_client, Client
 
-from data import get_db, User, Item  # Import from data.py
+from data import get_db, User, Item  # Importing from our data.py
 
 # ---------- Configuration ----------
-SECRET_KEY = "your-secret-key-change-in-production"
+SECRET_KEY = "your-secret-key-change-in-production-please"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
-# Supabase (set these in environment or .env)
+# Supabase (Render Environment Variables se aayega)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise RuntimeError("Supabase URL and key must be set in environment variables")
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Sirf tabhi connect karein jab details available hon (warna crash nahi hoga, bas file upload block hoga)
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+else:
+    supabase = None
 
 # ---------- Security ----------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -65,8 +67,22 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     return user
 
-# ---------- FastAPI App ----------
-app = FastAPI(title="Two-File Modular Server")
+# ---------- FastAPI App Setup ----------
+app = FastAPI(title="Advanced Cloud-Ready Server")
+
+# CORS Setup - Ye bohot zaroori hai agar frontend se API call karni hai
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Production me isko apne domain se replace karein
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------- Health Check ----------
+@app.get("/")
+def root():
+    return {"message": "Server is 100% Live and Working on Render!"}
 
 # ---------- Authentication Endpoints ----------
 @app.post("/auth/register")
@@ -101,9 +117,10 @@ def read_users_me(current_user = Depends(get_current_user)):
 # ---------- File Upload (Supabase) ----------
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...), user = Depends(get_current_user)):
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Supabase credentials not configured in environment")
     try:
         content = await file.read()
-        # Upload to Supabase bucket "uploads"
         supabase.storage.from_("uploads").upload(file.filename, content)
         public_url = supabase.storage.from_("uploads").get_public_url(file.filename)
         return {"filename": file.filename, "url": public_url}
@@ -171,55 +188,11 @@ def delete_item(item_id: int, db: Session = Depends(get_db), user = Depends(get_
     db.commit()
     return {"ok": True}
 
-# ---------- Pendrive Detection (Linux) ----------
-@app.get("/pendrive/list")
-def list_usb_drives():
-    try:
-        result = subprocess.run(["lsblk", "-o", "NAME,MOUNTPOINT,LABEL,SIZE,TYPE", "-J"],
-                                capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        usb_drives = []
-        for device in data.get("blockdevices", []):
-            # Look for disks with mount points (assuming USB are mounted)
-            if device.get("type") == "disk" and device.get("mountpoint"):
-                usb_drives.append({
-                    "name": device["name"],
-                    "size": device["size"],
-                    "mountpoint": device.get("mountpoint"),
-                    "label": device.get("label")
-                })
-        return {"drives": usb_drives}
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-# ---------- WiFi Management (Linux, requires root) ----------
-from wifi import Cell, Scheme  # pip install wifi
-
-INTERFACE = "wlan0"  # Change to your WiFi interface
-
-@app.get("/wifi/scan")
-def scan_wifi():
-    try:
-        cells = list(Cell.all(INTERFACE))
-        return [{"ssid": c.ssid, "signal": c.signal, "encrypted": c.encrypted} for c in cells]
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
-@app.post("/wifi/connect")
-def connect_wifi(ssid: str, password: str):
-    try:
-        cells = Cell.all(INTERFACE)
-        cell = next((c for c in cells if c.ssid == ssid), None)
-        if not cell:
-            raise HTTPException(404, "Network not found")
-        scheme = Scheme.for_cell(INTERFACE, "my_wifi", cell, password)
-        scheme.save()
-        scheme.activate()
-        return {"message": f"Connected to {ssid}"}
-    except Exception as e:
-        raise HTTPException(500, str(e))
+# Hardware APIs (Wifi/Pendrive) removed because they will crash a cloud server like Render.
 
 # ---------- Run ----------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    # Render assigns a dynamic port via environment variable. Fallback to 8000 for local testing.
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
