@@ -1,50 +1,52 @@
 import os
+import requests
 from datetime import datetime, timedelta
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Form, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 
-# Cloud Storage Libraries
+# Cloud Storage
 from supabase import create_client, Client
 import cloudinary
 import cloudinary.uploader
 
-# 🔥 Firebase Admin SDK 🔥
+# Firebase
 import firebase_admin
 from firebase_admin import credentials, firestore
 
 # ---------- Firebase Setup ----------
-# Render par hum ek 'Secret File' banayenge jiska naam firebase.json hoga
 try:
     cred = credentials.Certificate("firebase.json")
     firebase_admin.initialize_app(cred)
 except Exception as e:
-    print(f"Firebase Error: {e}. Make sure firebase.json exists!")
+    print(f"Firebase Error: {e}. Secret file missing!")
 
 db = firestore.client()
 
 # ---------- Configs ----------
-SECRET_KEY = os.getenv("SECRET_KEY", "Raaz-Super-Secret-Key-2026")
+SECRET_KEY = os.getenv("SECRET_KEY", "Raaz-Master-Key-2026")
 ALGORITHM = "HS256"
 
 # Supabase Auth
 SUPABASE_URL = os.getenv("SUPABASE_URL", "https://bvulvlcwjuligeaaligq.supabase.co")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJ2dWx2bGN3anVsaWdlYWFsaWdxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxNTgwNjMsImV4cCI6MjA4NzczNDA2M30.6LINOcy7O66yO-m9_-DwnNQ0hrIgo8e0CB6Qc-wPggU")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY") # Render env se aayega
 SUPABASE_BUCKET = "Raaz"
-
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_KEY else None
 
 # Cloudinary Auth
 CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 if CLOUDINARY_URL:
     cloudinary.config(url=CLOUDINARY_URL)
 
-# ---------- Security ----------
+# GitHub Category JSON URL (Isko apne asli github raw link se change kar lena)
+GITHUB_CATEGORY_URL = "https://raw.githubusercontent.com/username/repo/main/category.json"
+
+# ---------- Security & Auth ----------
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token")
 
@@ -53,177 +55,263 @@ def get_password_hash(password): return pwd_context.hash(password)
 
 def create_access_token(data: dict):
     to_encode = data.copy()
-    expire = datetime.utcnow() + timedelta(minutes=1440) # 24 Hours
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": datetime.utcnow() + timedelta(days=30)}) # 30 days login
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
+        role: str = payload.get("role")
         if username is None: raise HTTPException(401)
+        return {"username": username, "role": role}
     except JWTError:
-        raise HTTPException(401)
-    
-    # Check in Firebase
-    users_ref = db.collection("users").where("username", "==", username).stream()
-    user_list = list(users_ref)
-    if not user_list: raise HTTPException(401, "User not found")
-    
-    user_data = user_list[0].to_dict()
-    user_data['id'] = user_list[0].id
-    return user_data
+        raise HTTPException(401, "Invalid or expired token")
 
-# ---------- App Setup ----------
-app = FastAPI(title="Pro Firebase API Server")
+# ---------- FastAPI Setup ----------
+app = FastAPI(title="Raaz Master API", description="4 Heavy Features Architecture")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---------- 1. Authentication (Firebase) ----------
-@app.post("/auth/register")
-def register(username: str, password: str):
-    users_ref = db.collection("users")
-    # Check if exists
-    existing_users = list(users_ref.where("username", "==", username).stream())
-    if len(existing_users) > 0:
-        raise HTTPException(400, "Username already exists")
-    
-    # Save to Firebase
-    new_user = {
-        "username": username,
-        "password_hash": get_password_hash(password),
-        "created_at": str(datetime.now())
-    }
-    users_ref.add(new_user)
-    return {"message": "User registered successfully!"}
 
-@app.post("/auth/token")
-def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    users_ref = db.collection("users").where("username", "==", form_data.username).stream()
-    user_list = list(users_ref)
-    
-    if not user_list:
-        raise HTTPException(401, "Wrong credentials")
-        
-    user_data = user_list[0].to_dict()
-    if not verify_password(form_data.password, user_data['password_hash']):
-        raise HTTPException(401, "Wrong credentials")
-        
-    return {"access_token": create_access_token({"sub": form_data.username}), "token_type": "bearer"}
-
-# ---------- 2. Storage APIs (Supabase & Cloudinary) ----------
-@app.post("/upload/supabase")
+# ==========================================
+# 1. STORAGE API (Supabase & Cloudinary)
+# ==========================================
+@app.post("/upload/supabase", tags=["1. Storage API"])
 async def upload_supabase(file: UploadFile = File(...), user=Depends(get_current_user)):
-    try:
-        content = await file.read()
-        supabase.storage.from_(SUPABASE_BUCKET).upload(file.filename, content)
-        url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(file.filename)
-        return {"url": url, "bucket": SUPABASE_BUCKET}
-    except Exception as e:
-        raise HTTPException(500, f"Supabase Error: {str(e)}")
+    if not supabase: raise HTTPException(500, "Supabase key missing")
+    content = await file.read()
+    supabase.storage.from_(SUPABASE_BUCKET).upload(file.filename, content)
+    url = supabase.storage.from_(SUPABASE_BUCKET).get_public_url(file.filename)
+    return {"url": url, "bucket": SUPABASE_BUCKET}
 
-@app.post("/upload/cloudinary")
+@app.post("/upload/cloudinary", tags=["1. Storage API"])
 async def upload_cloudinary(file: UploadFile = File(...), user=Depends(get_current_user)):
     if not CLOUDINARY_URL: raise HTTPException(500, "Cloudinary not configured")
-    try:
-        result = cloudinary.uploader.upload(file.file)
-        return {"url": result.get("secure_url")}
-    except Exception as e:
-        raise HTTPException(500, f"Cloudinary Error: {str(e)}")
+    result = cloudinary.uploader.upload(file.file)
+    return {"url": result.get("secure_url")}
 
-# ---------- 3. Posts & Categories (Firebase) ----------
-@app.get("/categories")
-def get_categories():
-    docs = db.collection("categories").stream()
-    return [{"id": doc.id, **doc.to_dict()} for doc in docs]
 
-@app.post("/categories")
-def create_category(name: str, description: str, user=Depends(get_current_user)):
-    if user['username'].lower() != "raaz": raise HTTPException(403, "Only Admin Raaz can create categories")
-    db.collection("categories").add({"name": name, "description": description})
-    return {"message": "Category Created"}
+# ==========================================
+# 2. POSTS & AUTH API (Firebase)
+# ==========================================
+@app.post("/auth/register", tags=["2. Posts & Users API"])
+def register(username: str, password: str):
+    if username.lower() == "raaz": raise HTTPException(400, "Master username is reserved")
+    users_ref = db.collection("users")
+    if len(list(users_ref.where("username", "==", username).stream())) > 0:
+        raise HTTPException(400, "Username already exists")
+    
+    users_ref.add({"username": username, "password_hash": get_password_hash(password)})
+    return {"message": "User registered! You can now login."}
 
-@app.get("/posts")
-def get_posts():
+@app.post("/auth/token", tags=["2. Posts & Users API"])
+def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    # 🔥 MASTER ADMIN LOGIN (Raaz / 2570)
+    if form_data.username == "Raaz" and form_data.password == "2570":
+        return {"access_token": create_access_token({"sub": "Raaz", "role": "admin"}), "token_type": "bearer"}
+    
+    # NORMAL USER LOGIN
+    users_ref = list(db.collection("users").where("username", "==", form_data.username).stream())
+    if not users_ref or not verify_password(form_data.password, users_ref[0].to_dict()['password_hash']):
+        raise HTTPException(401, "Wrong credentials")
+        
+    return {"access_token": create_access_token({"sub": form_data.username, "role": "user"}), "token_type": "bearer"}
+
+@app.get("/posts", tags=["2. Posts & Users API"])
+def read_all_posts():
+    # Public route - Bina login ke koi bhi padh sakta hai!
     docs = db.collection("posts").stream()
     return [{"id": doc.id, **doc.to_dict()} for doc in docs]
 
-@app.post("/posts")
-def create_post(title: str = Form(...), description: str = Form(...), image_url: str = Form(None), category_id: str = Form(None), user=Depends(get_current_user)):
-    new_post = {
-        "title": title,
-        "description": description,
-        "image_url": image_url,
-        "category_id": category_id,
-        "owner": user['username'],
-        "timestamp": str(datetime.now())
-    }
+@app.post("/posts", tags=["2. Posts & Users API"])
+def publish_post(title: str = Form(...), description: str = Form(...), image_url: str = Form(""), category: str = Form(""), user=Depends(get_current_user)):
+    # User ko logged in hona zaroori hai post karne ke liye
+    new_post = {"title": title, "description": description, "image_url": image_url, "category": category, "owner": user['username'], "date": str(datetime.now().date())}
     db.collection("posts").add(new_post)
-    return {"message": "Post Created Successfully in Firebase"}
+    return {"message": "Post Published Successfully!"}
 
-# ---------- 4. App System Config (Firebase) ----------
-@app.get("/app/config")
-def get_app_config():
-    docs = list(db.collection("app_config").document("main_config").get())
-    # Return default if not exists
+@app.delete("/posts/{post_id}", tags=["2. Posts & Users API"])
+def delete_post(post_id: str, user=Depends(get_current_user)):
+    # Sirf ADMIN delete kar sakta hai
+    if user['role'] != 'admin': raise HTTPException(403, "Only Master Raaz can delete posts")
+    db.collection("posts").document(post_id).delete()
+    return {"message": "Post Deleted from Firebase"}
+
+
+# ==========================================
+# 3. CATEGORY API (GitHub JSON)
+# ==========================================
+@app.get("/categories", tags=["3. Category API"])
+def get_categories_from_github():
+    try:
+        # GitHub se live data fetch karna
+        response = requests.get(GITHUB_CATEGORY_URL)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            # Agar file na mile toh default return karo
+            return [{"id": 1, "name": "Default", "desc": "Edit GITHUB_CATEGORY_URL in code"}]
+    except:
+        return [{"error": "Failed to load from GitHub"}]
+
+
+# ==========================================
+# 4. APP SETTINGS API
+# ==========================================
+@app.get("/app/config", tags=["4. App Settings API"])
+def get_app_settings(request: Request):
+    docs = list(db.collection("app_settings").document("main").get())
+    
+    # Device Detection (User-Agent header read karke)
+    user_device = request.headers.get('User-Agent', 'Unknown Device')
+    
     if not docs:
-        default_config = {"maintenance": False, "version": "1.0.0", "update_url": "https://playstore.com"}
-        db.collection("app_config").document("main_config").set(default_config)
-        return default_config
-    return docs.to_dict()
+        default_cfg = {
+            "maintenance": False, 
+            "version": "1.0.0", 
+            "update_url": "https://playstore.com",
+            "night_mode": True,
+            "security_check": "Safe"
+        }
+        db.collection("app_settings").document("main").set(default_cfg)
+        return {"settings": default_cfg, "detected_device": user_device}
+        
+    return {"settings": docs.to_dict(), "detected_device": user_device}
 
-# ---------- 5. DARK MODE ADMIN DASHBOARD ----------
-@app.get("/admin", response_class=HTMLResponse)
-def admin_panel():
+@app.post("/app/config", tags=["4. App Settings API"])
+def update_app_settings(maintenance: bool = Form(...), version: str = Form(...), update_url: str = Form(...), night_mode: bool = Form(...), security_check: str = Form(...), user=Depends(get_current_user)):
+    if user['role'] != 'admin': raise HTTPException(403, "Access Denied")
+    
+    new_cfg = {
+        "maintenance": maintenance, "version": version, 
+        "update_url": update_url, "night_mode": night_mode, "security_check": security_check
+    }
+    db.collection("app_settings").document("main").set(new_cfg)
+    return {"message": "Settings Updated Live!"}
+
+
+# ==========================================
+# 👑 THE MASTER ADMIN HTML PANEL
+# ==========================================
+@app.get("/admin", response_class=HTMLResponse, include_in_schema=False)
+def master_admin_panel():
     return """
     <!DOCTYPE html>
     <html lang="en">
     <head>
-        <title>Raaz - Firebase Admin Panel</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Master Raaz | Control Center</title>
         <style>
-            body { background-color: #0d1117; color: #ff9900; font-family: 'Courier New', Courier, monospace; padding: 20px; text-align: center; }
-            .container { max-width: 400px; margin: auto; background: #161b22; padding: 30px; border-radius: 10px; box-shadow: 0px 0px 15px rgba(255, 153, 0, 0.3); border: 1px solid #30363d; }
-            input, button { width: 90%; padding: 12px; margin: 10px 0; border-radius: 5px; border: 1px solid #30363d; background: #0d1117; color: #c9d1d9; }
-            button { background: #ff9900; color: black; font-weight: bold; cursor: pointer; border: none; }
-            button:hover { background: #e68a00; }
+            body { font-family: 'Courier New', Courier, monospace; background: #000; color: #0f0; margin: 0; padding: 20px;}
+            h1 { text-align: center; border-bottom: 2px solid #0f0; padding-bottom: 10px; text-transform: uppercase;}
+            .box { border: 1px solid #0f0; padding: 20px; margin: 20px auto; max-width: 600px; background: #111; box-shadow: 0 0 10px #0f0;}
+            input, button, select { width: 95%; padding: 10px; margin: 10px 0; background: #000; color: #0f0; border: 1px solid #0f0;}
+            button { background: #0f0; color: #000; font-weight: bold; cursor: pointer;}
+            button:hover { background: #fff; box-shadow: 0 0 15px #0f0;}
+            .danger { background: red; color: white; border-color: red;}
+            .danger:hover { background: #fff; color: red;}
             #dashboard { display: none; }
+            .post-item { border-left: 3px solid #0f0; padding: 10px; margin-bottom: 10px; background: #222;}
         </style>
     </head>
     <body>
-        <div class="container" id="loginBox">
-            <h2>🔥 RAAZ FIREBASE ADMIN</h2>
-            <input type="text" id="adminUser" placeholder="Username (Raaz)">
-            <input type="password" id="adminPass" placeholder="Password">
-            <button onclick="adminLogin()">SECURE LOGIN</button>
-            <p id="msg" style="color:#ff7b72;"></p>
+        <h1>💻 RAAZ HACKER TERMINAL</h1>
+        
+        <div class="box" id="loginBox">
+            <h3>Admin Login</h3>
+            <input type="text" id="user" placeholder="Username (Raaz)">
+            <input type="password" id="pass" placeholder="Password (2570)">
+            <button onclick="login()">INITIALIZE SYSTEM</button>
+            <p id="msg" style="color:red;"></p>
         </div>
 
-        <div class="container" id="dashboard">
-            <h2>Welcome, Master Raaz 👑</h2>
-            <p style="color: #8b949e; font-size: 14px;">Firebase Server API Management</p>
-            <button onclick="window.location.href='/docs'">Open API Manager (Swagger)</button>
-            <button style="background: #da3633; color: white;" onclick="location.reload()">Logout</button>
+        <div id="dashboard">
+            <div class="box">
+                <h2>🎛️ App Settings (Live Sync)</h2>
+                <label>Maintenance Mode:</label>
+                <select id="cfg-maint"><option value="false">OFF (Live)</option><option value="true">ON (Blocked)</option></select>
+                <input type="text" id="cfg-ver" placeholder="App Version (e.g. 1.0.0)">
+                <input type="text" id="cfg-url" placeholder="Update URL">
+                <label>Force Night Mode:</label>
+                <select id="cfg-night"><option value="true">ON</option><option value="false">OFF</option></select>
+                <input type="text" id="cfg-sec" placeholder="Security Status (e.g. SAFE)">
+                <button onclick="saveSettings()">DEPLOY SETTINGS TO ALL APPS</button>
+            </div>
+
+            <div class="box">
+                <h2>🗑️ Manage Posts (Firebase)</h2>
+                <button onclick="loadPosts()" style="background:transparent; color:#0f0;">Refresh Posts Database</button>
+                <div id="postsList">Loading...</div>
+            </div>
+            
+            <button class="danger" style="display:block; margin:auto; width:200px;" onclick="location.reload()">SYSTEM LOGOUT</button>
         </div>
 
         <script>
-            async function adminLogin() {
-                let u = document.getElementById("adminUser").value;
-                let p = document.getElementById("adminPass").value;
-                let formData = new URLSearchParams(); formData.append("username", u); formData.append("password", p);
-                let res = await fetch("/auth/token", { method: "POST", body: formData });
+            let token = "";
+            async function login() {
+                let u = document.getElementById("user").value;
+                let p = document.getElementById("pass").value;
+                let body = new URLSearchParams(); body.append("username", u); body.append("password", p);
+                
+                let res = await fetch("/auth/token", { method: "POST", body: body });
                 if(res.ok) {
-                    if (u.toLowerCase() === "raaz") {
-                        document.getElementById("loginBox").style.display = "none";
-                        document.getElementById("dashboard").style.display = "block";
-                    } else { document.getElementById("msg").innerText = "Access Denied!"; }
-                } else { document.getElementById("msg").innerText = "Invalid Credentials!"; }
+                    let data = await res.json();
+                    token = data.access_token;
+                    document.getElementById("loginBox").style.display = "none";
+                    document.getElementById("dashboard").style.display = "block";
+                    loadConfig(); loadPosts();
+                } else {
+                    document.getElementById("msg").innerText = "ACCESS DENIED!";
+                }
+            }
+
+            async function loadConfig() {
+                let res = await fetch("/app/config");
+                let data = await res.json();
+                let s = data.settings;
+                document.getElementById("cfg-maint").value = s.maintenance;
+                document.getElementById("cfg-ver").value = s.version;
+                document.getElementById("cfg-url").value = s.update_url;
+                document.getElementById("cfg-night").value = s.night_mode;
+                document.getElementById("cfg-sec").value = s.security_check;
+            }
+
+            async function saveSettings() {
+                let body = new URLSearchParams();
+                body.append("maintenance", document.getElementById("cfg-maint").value);
+                body.append("version", document.getElementById("cfg-ver").value);
+                body.append("update_url", document.getElementById("cfg-url").value);
+                body.append("night_mode", document.getElementById("cfg-night").value);
+                body.append("security_check", document.getElementById("cfg-sec").value);
+
+                let res = await fetch("/app/config", {
+                    method: "POST",
+                    headers: { "Authorization": "Bearer " + token },
+                    body: body
+                });
+                if(res.ok) alert("HACK SUCCESSFUL: App Settings Updated!");
+            }
+
+            async function loadPosts() {
+                let res = await fetch("/posts");
+                let data = await res.json();
+                let html = "";
+                data.forEach(p => {
+                    html += `<div class="post-item">
+                        <b>${p.title}</b> (By ${p.owner})<br>
+                        <button class="danger" style="width:100px; padding:5px;" onclick="deletePost('${p.id}')">Delete Post</button>
+                    </div>`;
+                });
+                document.getElementById("postsList").innerHTML = html || "No Posts Found.";
+            }
+
+            async function deletePost(id) {
+                if(!confirm("Are you sure?")) return;
+                let res = await fetch("/posts/" + id, { method: "DELETE", headers: { "Authorization": "Bearer " + token } });
+                if(res.ok) loadPosts();
             }
         </script>
     </body>
     </html>
     """
-
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port)
