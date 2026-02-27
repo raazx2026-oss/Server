@@ -1,6 +1,5 @@
 fastapi
 uvicorn
-sqlalchemy
 python-jose[cryptography]
 passlib[bcrypt]
 bcrypt==3.2.2
@@ -8,3 +7,4 @@ python-multipart
 supabase
 websockets
 cloudinary
+firebase-admin
